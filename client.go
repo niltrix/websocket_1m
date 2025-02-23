@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"sync"
@@ -203,13 +202,13 @@ func main() {
 	// numClients := 10
 
 	ws := flag.String("ws", "ws://localhost:8080/ws", "URI of the server to connect to")
-	uri := flag.String("http", "http://localhost:8080", "URI of the server to connect to")
+	// uri := flag.String("http", "http://localhost:8080", "URI of the server to connect to")
 	conn := flag.Int("conn", 10, "Number of clients to simulate")
 
 	flag.Parse()
 
 	serverURI := *ws
-	httpURI := *uri
+	// httpURI := *uri
 	numClients := *conn
 
 	mux := http.NewServeMux()
@@ -230,16 +229,16 @@ func main() {
 		}
 	}
 
-	time.Sleep(60 * time.Second)
-
-	for i := 0; i < 10; i++ {
-		randomClient := fmt.Sprintf("client_%d", rand.Intn(numClients))
-		message := fmt.Sprintf("Test push at %v with a potentially very long message to test POST body handling", time.Now())
-		if err := pushMessage(context.Background(), httpURI, randomClient, message); err != nil {
-			logger.Error("Push failed", zap.Error(err))
-		}
-		time.Sleep(1 * time.Second)
-	}
+	// time.Sleep(60 * time.Second)
+	//
+	// for i := 0; i < 10; i++ {
+	// 	randomClient := fmt.Sprintf("client_%d", rand.Intn(numClients))
+	// 	message := fmt.Sprintf("Test push at %v with a potentially very long message to test POST body handling", time.Now())
+	// 	if err := pushMessage(context.Background(), httpURI, randomClient, message); err != nil {
+	// 		logger.Error("Push failed", zap.Error(err))
+	// 	}
+	// 	time.Sleep(1 * time.Second)
+	// }
 
 	logger.Info("Total time for setup", zap.Float64("seconds", time.Since(startTime).Seconds()))
 	wg.Wait()

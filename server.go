@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"reflect"
 	"runtime"
 	"sync"
 	"syscall"
@@ -26,6 +27,8 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/sys/unix"
+
+	_ "net/http/pprof"
 )
 
 var (
@@ -34,10 +37,16 @@ var (
 	logger *zap.Logger
 )
 
+// Connection 구조체에 뮤텍스 추가
+type Connection struct {
+	conn net.Conn
+	mu   sync.Mutex
+}
+
 type Epoll struct {
 	fd          int
-	connections map[int]net.Conn
-	clients     map[string]net.Conn
+	connections map[int]*Connection    // fd를 키로 하는 연결 맵
+	clients     map[string]*Connection // client_id를 키로 하는 연결 맵
 	lock        *sync.RWMutex
 }
 
@@ -48,8 +57,8 @@ func NewEpoll() (*Epoll, error) {
 	}
 	return &Epoll{
 		fd:          fd,
-		connections: make(map[int]net.Conn),
-		clients:     make(map[string]net.Conn),
+		connections: make(map[int]*Connection),
+		clients:     make(map[string]*Connection),
 		lock:        &sync.RWMutex{},
 	}, nil
 }
@@ -72,8 +81,8 @@ func (e *Epoll) Add(conn net.Conn, clientID string) error {
 		return err
 	}
 	e.lock.Lock()
-	e.connections[fd] = conn
-	e.clients[clientID] = conn
+	e.connections[fd] = &Connection{conn: conn}
+	e.clients[clientID] = e.connections[fd]
 	e.lock.Unlock()
 	counter, err := meter.Int64UpDownCounter("websocket_active_connections")
 	if err == nil {
@@ -88,9 +97,10 @@ func (e *Epoll) Remove(conn net.Conn, clientID string) error {
 	defer span.End()
 
 	fd := getFD(conn)
+
 	e.lock.Lock()
-	if _, exists := e.connections[fd]; !exists {
-		// 이미 제거된 경우 무시
+	_, exists := e.connections[fd]
+	if !exists {
 		e.lock.Unlock()
 		logger.Debug("Connection already removed from epoll", zap.String("client_id", clientID), zap.Int("fd", fd))
 		return nil
@@ -100,22 +110,21 @@ func (e *Epoll) Remove(conn net.Conn, clientID string) error {
 	delete(e.clients, clientID)
 	e.lock.Unlock()
 
+	counter, err2 := meter.Int64UpDownCounter("websocket_active_connections")
+	if err2 == nil {
+		counter.Add(ctx, -1)
+	}
 	if err != nil {
-		// EBADF 또는 ENOENT는 클라이언트 연결 종료로 인한 정상 상황으로 간주
 		if err == unix.EBADF || err == unix.ENOENT {
 			logger.Debug("Connection already closed or removed from epoll", zap.String("client_id", clientID), zap.Error(err))
 		} else {
-			counter, err := meter.Int64Counter("websocket_errors_total")
-			if err == nil {
+			counter, err3 := meter.Int64Counter("websocket_errors_total")
+			if err3 == nil {
 				counter.Add(ctx, 1)
 			}
 			logger.Warn("Failed to remove connection from epoll", zap.Error(err), zap.String("client_id", clientID))
 		}
 	} else {
-		counter, err := meter.Int64UpDownCounter("websocket_active_connections")
-		if err == nil {
-			counter.Add(ctx, -1)
-		}
 		logger.Info("Client disconnected", zap.String("client_id", clientID), zap.Int("total_clients", len(e.clients)))
 	}
 	return nil
@@ -123,29 +132,71 @@ func (e *Epoll) Remove(conn net.Conn, clientID string) error {
 
 func (e *Epoll) Wait() ([]net.Conn, error) {
 	events := make([]unix.EpollEvent, 100)
-	n, err := unix.EpollWait(e.fd, events, -1)
-	if err != nil {
-		counter, err := meter.Int64Counter("websocket_errors_total")
-		if err == nil {
+	n, err := unix.EpollWait(e.fd, events, 100)
+	if err != nil && err != syscall.EINTR {
+		counter, err2 := meter.Int64Counter("websocket_errors_total")
+		if err2 == nil {
 			counter.Add(context.Background(), 1)
 		}
 		logger.Error("Epoll wait error", zap.Error(err))
 		return nil, err
 	}
-	e.lock.RLock()
-	defer e.lock.RUnlock()
+
 	var conns []net.Conn
+	var closedFds []int
+
 	for i := 0; i < n; i++ {
-		conn := e.connections[int(events[i].Fd)]
-		conns = append(conns, conn)
+		fd := int(events[i].Fd)
+
+		// 보호된 영역에서 FD의 존재 여부를 확인
+		e.lock.RLock()
+		connObj, ok := e.connections[fd]
+		e.lock.RUnlock()
+
+		// FD 삭제되거나 connObj가 nil인 경우
+		if !ok || connObj == nil {
+			// 해당 FD가 이미 삭제된 경우, epoll 인스턴스에서 제거 시도
+			if err := unix.EpollCtl(e.fd, syscall.EPOLL_CTL_DEL, fd, nil); err != nil &&
+				err != syscall.EBADF && err != syscall.ENOENT && err != syscall.EPERM {
+				logger.Debug("Failed to delete epoll fd", zap.Int("fd", fd), zap.Error(err))
+			}
+			counter, err := meter.Int64UpDownCounter("websocket_active_connections")
+			if err == nil {
+				counter.Add(context.Background(), -1)
+			}
+			closedFds = append(closedFds, fd)
+			continue
+		}
+
+		conns = append(conns, connObj.conn)
+	}
+
+	if len(closedFds) > 0 {
+		logger.Debug("Received epoll events for closed (or nil) connections",
+			zap.Ints("fds", closedFds),
+			zap.Int("closed_count", len(closedFds)),
+			zap.Int("total_connections", len(e.connections)))
 	}
 	return conns, nil
 }
 
 func getFD(conn net.Conn) int {
-	tcpConn := conn.(*net.TCPConn)
-	f, _ := tcpConn.File()
-	return int(f.Fd())
+	tcpConn := reflect.Indirect(reflect.ValueOf(conn)).FieldByName("conn")
+	fdVal := tcpConn.FieldByName("fd")
+	pfdVal := reflect.Indirect(fdVal).FieldByName("pfd")
+
+	return int(pfdVal.FieldByName("Sysfd").Int())
+
+	// 아래 코드는 버그가 있음,
+	// tcpConn, ok := conn.(*net.TCPConn)
+	// if !ok {
+	// 	return -1
+	// }
+	// fd, err := tcpConn.File()
+	// if err != nil {
+	// 	return -1
+	// }
+	// return int(fd.Fd())
 }
 
 func monitorMemory(ctx context.Context) {
@@ -172,7 +223,6 @@ func initTelemetry() (func(), error) {
 		return nil, err
 	}
 
-	// traceExporter, err := otlptracegrpc.New(ctx, otlptracegrpc.WithInsecure(), otlptracegrpc.WithEndpoint("localhost:4317"))
 	traceExporter, err := otlptracehttp.New(ctx)
 	if err != nil {
 		return nil, err
@@ -217,11 +267,29 @@ func initTelemetry() (func(), error) {
 }
 
 func main() {
+
+	// Increase resources limitations
+	var rLimit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
+		panic(err)
+	}
+	rLimit.Cur = rLimit.Max
+	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
+		panic(err)
+	}
+
 	shutdown, err := initTelemetry()
 	if err != nil {
 		logger.Fatal("Failed to initialize telemetry", zap.Error(err))
 	}
 	defer shutdown()
+
+	// Enable pprof hooks
+	go func() {
+		if err := http.ListenAndServe(":6060", nil); err != nil {
+			logger.Fatal("pprof failed", zap.Error(err))
+		}
+	}()
 
 	epoll, err := NewEpoll()
 	if err != nil {
@@ -302,14 +370,19 @@ func main() {
 		span.SetAttributes(attribute.String("client_id", clientID), attribute.String("message", string(message)))
 
 		epoll.lock.RLock()
-		conn, exists := epoll.clients[clientID]
+		connection, exists := epoll.clients[clientID]
 		epoll.lock.RUnlock()
 		if !exists {
 			http.Error(w, "Client not found", http.StatusNotFound)
 			logger.Warn("Client not found", zap.String("client_id", clientID))
 			return
 		}
-		err = wsutil.WriteServerText(conn, message)
+
+		// 뮤텍스를 사용하여 동기화
+		connection.mu.Lock()
+		err = wsutil.WriteServerText(connection.conn, message)
+		connection.mu.Unlock()
+
 		if err != nil {
 			counter, err := meter.Int64Counter("websocket_errors_total")
 			if err == nil {
