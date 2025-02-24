@@ -8,13 +8,16 @@ const customMetrics = {
   failedPushes: new Counter('failed_pushes'),
 };
 
+// 환경 변수에서 최대 client_id 값 가져오기 (기본값: 100)
+const MAX_CLIENT_ID = __ENV.MAX_CLIENT_ID ? parseInt(__ENV.MAX_CLIENT_ID) : 100;
+
 // 테스트 설정
 export const options = {
   scenarios: {
     push_requests: {
       executor: 'per-vu-iterations',
-      vus: 10,               // 동시 실행 VU 수
-      iterations: 100,       // 총 반복 횟수 (0부터 9까지의 client_id 사용)
+      vus: 10000,               // 동시 실행 VU 수
+      iterations: 100,       // 총 반복 횟수
       maxDuration: '60s',   // 최대 실행 시간
     },
   },
@@ -24,11 +27,12 @@ export const options = {
   },
 };
 
-const BASE_URL = 'http://localhost:8080';
+const BASE_URL = 'http://k8s-meditbac-wsserver-47900150f5-a1083ea59ce1dfb7.elb.us-east-1.amazonaws.com:8080';
 
 export default function () {
-  // iteration 번호를 client_id로 사용 (0부터 시작)
-  const clientId = `client_${__ITER}`;
+  // 랜덤한 client_id 생성
+  const randomId = Math.floor(Math.random() * (MAX_CLIENT_ID - 1));
+  const clientId = `client_${randomId}`;
   
   const payload = JSON.stringify({
     message: `test message from ${clientId}`
@@ -65,24 +69,25 @@ export default function () {
   }
 
   // 요청 간 간격 (1초)
-  sleep(1);
+  sleep(0.01);
 }
 
 // 결과 리포트 생성
-export function handleSummary(data) {
-  const summary = {
-    metrics: {
-      total_requests: data.metrics.http_reqs.values.count,
-      successful_requests: data.metrics.successful_pushes.values.count,
-      failed_requests: data.metrics.failed_pushes.values.count,
-      avg_duration: `${data.metrics.http_req_duration.values.avg.toFixed(2)}ms`,
-      p95_duration: `${data.metrics.http_req_duration.values['p(95)'].toFixed(2)}ms`,
-    },
-    checks: data.metrics.checks,
-  };
+// export function handleSummary(data) {
+//   const summary = {
+//     metrics: {
+//       total_requests: data.metrics.http_reqs.values.count,
+//       successful_requests: data.metrics.successful_pushes.values.count,
+//       failed_requests: data.metrics.failed_pushes.values.count,
+//       avg_duration: `${data.metrics.http_req_duration.values.avg.toFixed(2)}ms`,
+//       p95_duration: `${data.metrics.http_req_duration.values['p(95)'].toFixed(2)}ms`,
+//       max_client_id: MAX_CLIENT_ID,
+//     },
+//     checks: data.metrics.checks,
+//   };
 
-  return {
-    'stdout': JSON.stringify(summary, null, 2),
-    'push_test_summary.json': JSON.stringify(data, null, 2),
-  };
-}
+//   return {
+//     'stdout': JSON.stringify(summary, null, 2),
+//     'push_test_summary.json': JSON.stringify(data, null, 2),
+//   };
+// }

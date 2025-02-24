@@ -14,7 +14,7 @@ if ! [[ $1 =~ ^[0-9]+$ ]] || ! [[ $2 =~ ^[0-9]+$ ]]; then
 fi
 
 # 기본 설정
-BASE_URL="http://localhost:8080"
+BASE_URL="http://k8s-meditbac-wsserver-47900150f5-a1083ea59ce1dfb7.elb.us-east-1.amazonaws.com:8080"
 ENDPOINT="/push"
 CONTENT_TYPE="Content-Type: application/json"
 MESSAGE='{"message":"test message"}'

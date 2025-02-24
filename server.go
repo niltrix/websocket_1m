@@ -155,15 +155,7 @@ func (e *Epoll) Wait() ([]net.Conn, error) {
 
 		// FD 삭제되거나 connObj가 nil인 경우
 		if !ok || connObj == nil {
-			// 해당 FD가 이미 삭제된 경우, epoll 인스턴스에서 제거 시도
-			if err := unix.EpollCtl(e.fd, syscall.EPOLL_CTL_DEL, fd, nil); err != nil &&
-				err != syscall.EBADF && err != syscall.ENOENT && err != syscall.EPERM {
-				logger.Debug("Failed to delete epoll fd", zap.Int("fd", fd), zap.Error(err))
-			}
-			counter, err := meter.Int64UpDownCounter("websocket_active_connections")
-			if err == nil {
-				counter.Add(context.Background(), -1)
-			}
+			logger.Debug("Skipping already removed epoll fd", zap.Int("fd", fd))
 			closedFds = append(closedFds, fd)
 			continue
 		}
